@@ -221,6 +221,33 @@ class _FakeConn:
         self.closed = True
 
 
+class _RecordingMetadataCursor(_FakeCursor):
+    def __init__(self, data):
+        super().__init__(data)
+        self.queries = []
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        super().execute(sql, params)
+        if params and len(params) > 1:
+            requested = {str(table).upper() for table in params[1:]}
+            if "INFORMATION_SCHEMA.COLUMNS" in sql:
+                self._rows = [row for row in self._rows if row[0].upper() in requested]
+            elif "INFORMATION_SCHEMA.TABLES" in sql:
+                self._rows = [row for row in self._rows if row[0].upper() in requested]
+            elif "INFORMATION_SCHEMA.VIEWS" in sql:
+                self._rows = [row for row in self._rows if row[0].upper() in requested]
+
+
+class _RecordingMetadataConn(_FakeConn):
+    def __init__(self, data):
+        super().__init__(data)
+        self.metadata_cursor = _RecordingMetadataCursor(data)
+
+    def cursor(self):
+        return self.metadata_cursor
+
+
 def _fake_data():
     return {
         # (TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COMMENT, CHAR_MAX, NUM_PREC, NUM_SCALE)
@@ -316,6 +343,147 @@ def test_fetch_metadata_table_filter():
     conn = _FakeConn(_fake_data())
     columns, _, _, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
     assert {c["table"] for c in columns} == {"CUSTOMER"}
+
+
+def test_selective_metadata_queries_use_parameterized_table_filters():
+    conn = _RecordingMetadataConn(_fake_data())
+
+    _fetch_metadata(conn, "db", "sch", ["customer", "orders"])
+
+    for source in ("COLUMNS", "TABLES"):
+        sql, params = next(
+            query for query in conn.metadata_cursor.queries
+            if f"INFORMATION_SCHEMA.{source}" in query[0]
+        )
+        assert "TABLE_NAME IN (%s, %s)" in sql
+        assert params == ("SCH", "CUSTOMER", "ORDERS")
+        assert "CUSTOMER" not in sql and "ORDERS" not in sql
+
+
+def test_selective_base_table_skips_views_and_show_columns_without_vectors():
+    data = _fake_data()
+    data["columns"] = [row for row in data["columns"] if row[0] == "CUSTOMER" and row[2] != "VECTOR"]
+    data["tables"] = [("CUSTOMER", "Customers", "BASE TABLE")]
+    conn = _RecordingMetadataConn(data)
+
+    columns, _, comments, types, view_definitions, full_types = _fetch_metadata(
+        conn, "db", "sch", ["customer"],
+    )
+
+    sql = [query[0] for query in conn.metadata_cursor.queries]
+    assert not any("INFORMATION_SCHEMA.VIEWS" in query for query in sql)
+    assert not any("SHOW COLUMNS" in query for query in sql)
+    assert {column["table"] for column in columns} == {"CUSTOMER"}
+    assert comments == {"CUSTOMER": "Customers"}
+    assert types == {"CUSTOMER": "BASE TABLE"}
+    assert view_definitions == {}
+    assert full_types == {}
+
+
+def test_selective_view_queries_only_requested_view_definition():
+    data = _fake_data()
+    data["views"].append(("UNRELATED_VIEW", "SELECT 1"))
+    conn = _RecordingMetadataConn(data)
+
+    _, _, _, _, view_definitions, _ = _fetch_metadata(conn, "db", "sch", ["orders"])
+
+    view_sql, params = next(
+        query for query in conn.metadata_cursor.queries
+        if "INFORMATION_SCHEMA.VIEWS" in query[0]
+    )
+    assert "TABLE_NAME IN (%s)" in view_sql
+    assert params == ("SCH", "ORDERS")
+    assert "ORDERS" not in view_sql
+    assert view_definitions == {"ORDERS": "SELECT id FROM raw_orders"}
+
+
+@pytest.mark.parametrize("tables", [None, []])
+def test_whole_schema_metadata_queries_keep_schema_scope(tables):
+    conn = _RecordingMetadataConn(_fake_data())
+
+    _fetch_metadata(conn, "db", "sch", tables)
+
+    for source in ("COLUMNS", "TABLES", "VIEWS"):
+        sql, params = next(
+            query for query in conn.metadata_cursor.queries
+            if f"INFORMATION_SCHEMA.{source}" in query[0]
+        )
+        assert "TABLE_NAME IN" not in sql
+        assert params == ("SCH",)
+
+
+def test_selective_vector_preserves_full_type_and_ignores_unrelated_show_rows():
+    data = _fake_data()
+    data["columns"] = [
+        ("CUSTOMER", "EMBEDDING", "VECTOR", "YES", None, None, None, None),
+        ("OTHER", "EMBEDDING", "VECTOR", "YES", None, None, None, None),
+    ]
+    data["tables"] = [
+        ("CUSTOMER", "Customers", "BASE TABLE"),
+        ("OTHER", None, "BASE TABLE"),
+    ]
+    data["show_columns"] = [
+        ("CUSTOMER", "SCH", "EMBEDDING",
+         '{"type":"VECTOR","vectorElementType":{"type":"REAL"},"dimension":768}'),
+        ("OTHER", "SCH", "EMBEDDING",
+         '{"type":"VECTOR","vectorElementType":{"type":"FIXED"},"dimension":3}'),
+    ]
+    conn = _RecordingMetadataConn(data)
+
+    _, _, _, _, _, full_types = _fetch_metadata(conn, "db", "sch", ["customer"])
+
+    show_queries = [
+        query for query in conn.metadata_cursor.queries if "SHOW COLUMNS" in query[0]
+    ]
+    assert len(show_queries) == 1
+    assert full_types == {("CUSTOMER", "EMBEDDING"): "VECTOR(FLOAT, 768)"}
+
+
+def test_selective_import_keeps_one_schema_wide_primary_key_query():
+    data = _fake_data()
+    data["pks"] = [
+        ("t", "DB", "SCH", "CUSTOMER", "ID", 1),
+        ("t", "DB", "SCH", "CUSTOMER", "EMAIL", 2),
+        ("t", "DB", "SCH", "ORDERS", "ID", 1),
+    ]
+    conn = _RecordingMetadataConn(data)
+
+    _, primary_keys, _, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
+
+    pk_queries = [
+        query for query in conn.metadata_cursor.queries if "SHOW PRIMARY KEYS" in query[0]
+    ]
+    assert pk_queries == [('SHOW PRIMARY KEYS IN SCHEMA "DB"."SCH"', None)]
+    assert primary_keys == {
+        "CUSTOMER": {"ID", "EMAIL"},
+        "ORDERS": {"ID"},
+    }
+
+
+def test_selective_sql_metadata_produces_equivalent_contract():
+    data = _fake_data()
+    server_info = {
+        "account": "ACME", "database": "DB", "schema": "SCH", "warehouse": None,
+    }
+
+    schema_wide_metadata = _fetch_metadata(_FakeConn(data), "db", "sch", ["orders"])
+    selective_metadata = _fetch_metadata(
+        _RecordingMetadataConn(data), "db", "sch", ["orders"],
+    )
+
+    def contract(metadata):
+        columns, primary_keys, comments, types, views, full_types = metadata
+        return build_snowflake_contract(
+            server_info=server_info,
+            columns=columns,
+            primary_keys=primary_keys,
+            table_comments=comments,
+            table_types=types,
+            view_definitions=views,
+            full_types=full_types,
+        )
+
+    assert contract(selective_metadata).model_dump() == contract(schema_wide_metadata).model_dump()
 
 
 def test_import_snowflake_end_to_end(monkeypatch):
