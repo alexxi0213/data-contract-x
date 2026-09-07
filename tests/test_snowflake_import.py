@@ -397,6 +397,41 @@ def test_selective_view_queries_only_requested_view_definition():
     assert view_definitions == {"ORDERS": "SELECT id FROM raw_orders"}
 
 
+@pytest.mark.parametrize(
+    ("table_type", "queries_views"),
+    [
+        ("VIEW", True),
+        ("MATERIALIZED VIEW", False),
+        ("BASE TABLE", False),
+        ("EXTERNAL TABLE", False),
+    ],
+)
+def test_selective_view_definition_lookup_matches_supported_object_types(
+    table_type, queries_views,
+):
+    data = _fake_data()
+    data["columns"] = [
+        ("OBJECT_A", "ID", "NUMBER", "NO", None, None, 38, 0),
+    ]
+    data["tables"] = [("OBJECT_A", None, table_type)]
+    data["views"] = [("OBJECT_A", "SELECT id FROM source")]
+    conn = _RecordingMetadataConn(data)
+
+    _, _, _, types, view_definitions, _ = _fetch_metadata(
+        conn, "db", "sch", ["object_a"],
+    )
+
+    queried_views = any(
+        "INFORMATION_SCHEMA.VIEWS" in sql
+        for sql, _ in conn.metadata_cursor.queries
+    )
+    assert queried_views is queries_views
+    assert types == {"OBJECT_A": table_type}
+    assert view_definitions == (
+        {"OBJECT_A": "SELECT id FROM source"} if queries_views else {}
+    )
+
+
 @pytest.mark.parametrize("tables", [None, []])
 def test_whole_schema_metadata_queries_keep_schema_scope(tables):
     conn = _RecordingMetadataConn(_fake_data())
