@@ -230,13 +230,20 @@ class _RecordingMetadataCursor(_FakeCursor):
         self.queries.append((sql, params))
         super().execute(sql, params)
         if params and len(params) > 1:
-            requested = {str(table).upper() for table in params[1:]}
+            requested = {str(table) for table in params[1:]}
+            case_insensitive = "UPPER(TABLE_NAME)" in sql
+
+            def matches(row):
+                if case_insensitive:
+                    return row[0].upper() in {name.upper() for name in requested}
+                return row[0] in requested
+
             if "INFORMATION_SCHEMA.COLUMNS" in sql:
-                self._rows = [row for row in self._rows if row[0].upper() in requested]
+                self._rows = [row for row in self._rows if matches(row)]
             elif "INFORMATION_SCHEMA.TABLES" in sql:
-                self._rows = [row for row in self._rows if row[0].upper() in requested]
+                self._rows = [row for row in self._rows if matches(row)]
             elif "INFORMATION_SCHEMA.VIEWS" in sql:
-                self._rows = [row for row in self._rows if row[0].upper() in requested]
+                self._rows = [row for row in self._rows if matches(row)]
 
 
 class _RecordingMetadataConn(_FakeConn):
@@ -355,9 +362,37 @@ def test_selective_metadata_queries_use_parameterized_table_filters():
             query for query in conn.metadata_cursor.queries
             if f"INFORMATION_SCHEMA.{source}" in query[0]
         )
-        assert "TABLE_NAME IN (%s, %s)" in sql
+        assert "UPPER(TABLE_NAME) IN (%s, %s)" in sql
         assert params == ("SCH", "CUSTOMER", "ORDERS")
         assert "CUSTOMER" not in sql and "ORDERS" not in sql
+
+
+@pytest.mark.parametrize(
+    ("requested_name", "metadata_name"),
+    [
+        ("orders", "orders"),
+        ("orders", "ORDERS"),
+        ("Orders", "ORDERS"),
+        ("ORDERS", "orders"),
+    ],
+)
+def test_selective_user_table_filter_preserves_legacy_case_insensitive_matching(
+    requested_name, metadata_name,
+):
+    data = _fake_data()
+    data["columns"] = [
+        (metadata_name, "id", "NUMBER", "NO", None, None, 38, 0),
+    ]
+    data["tables"] = [(metadata_name, "Orders", "BASE TABLE")]
+    conn = _RecordingMetadataConn(data)
+
+    columns, _, comments, types, _, _ = _fetch_metadata(
+        conn, "db", "sch", [requested_name],
+    )
+
+    assert [column["table"] for column in columns] == [metadata_name]
+    assert comments == {metadata_name: "Orders"}
+    assert types == {metadata_name: "BASE TABLE"}
 
 
 def test_selective_base_table_skips_views_and_show_columns_without_vectors():
@@ -392,9 +427,35 @@ def test_selective_view_queries_only_requested_view_definition():
         if "INFORMATION_SCHEMA.VIEWS" in query[0]
     )
     assert "TABLE_NAME IN (%s)" in view_sql
+    assert "UPPER(TABLE_NAME)" not in view_sql
     assert params == ("SCH", "ORDERS")
     assert "ORDERS" not in view_sql
     assert view_definitions == {"ORDERS": "SELECT id FROM raw_orders"}
+
+
+def test_selective_view_lookup_uses_exact_resolved_metadata_name():
+    data = _fake_data()
+    data["columns"] = [
+        ("orders", "id", "NUMBER", "NO", None, None, 38, 0),
+    ]
+    data["tables"] = [("orders", None, "VIEW")]
+    data["views"] = [("orders", "SELECT id FROM source")]
+    conn = _RecordingMetadataConn(data)
+
+    columns, _, _, types, view_definitions, _ = _fetch_metadata(
+        conn, "db", "sch", ["ORDERS"],
+    )
+
+    view_sql, params = next(
+        query for query in conn.metadata_cursor.queries
+        if "INFORMATION_SCHEMA.VIEWS" in query[0]
+    )
+    assert "TABLE_NAME IN (%s)" in view_sql
+    assert "UPPER(TABLE_NAME)" not in view_sql
+    assert params == ("SCH", "orders")
+    assert [column["table"] for column in columns] == ["orders"]
+    assert types == {"orders": "VIEW"}
+    assert view_definitions == {"orders": "SELECT id FROM source"}
 
 
 @pytest.mark.parametrize(
@@ -519,6 +580,42 @@ def test_selective_sql_metadata_produces_equivalent_contract():
         )
 
     assert contract(selective_metadata).model_dump() == contract(schema_wide_metadata).model_dump()
+
+
+def test_lowercase_metadata_contract_matches_legacy_case_insensitive_filtering():
+    data = {
+        "columns": [
+            ("orders", "id", "NUMBER", "NO", "key", None, 38, 0),
+        ],
+        "tables": [("orders", "Orders", "BASE TABLE")],
+        "views": [],
+        "pks": [("t", "DB", "SCH", "orders", "id", 1)],
+    }
+    server_info = {
+        "account": "ACME", "database": "DB", "schema": "SCH", "warehouse": None,
+    }
+
+    legacy_metadata = _fetch_metadata(_FakeConn(data), "db", "sch", ["ORDERS"])
+    optimized_metadata = _fetch_metadata(
+        _RecordingMetadataConn(data), "db", "sch", ["Orders"],
+    )
+
+    def contract(metadata):
+        columns, primary_keys, comments, types, views, full_types = metadata
+        return build_snowflake_contract(
+            server_info=server_info,
+            columns=columns,
+            primary_keys=primary_keys,
+            table_comments=comments,
+            table_types=types,
+            view_definitions=views,
+            full_types=full_types,
+        )
+
+    legacy_contract = contract(legacy_metadata)
+    optimized_contract = contract(optimized_metadata)
+    assert optimized_contract.model_dump() == legacy_contract.model_dump()
+    assert optimized_contract.schema_[0].name == "orders"
 
 
 def test_import_snowflake_end_to_end(monkeypatch):

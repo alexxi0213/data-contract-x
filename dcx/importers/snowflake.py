@@ -719,10 +719,26 @@ def _connect(import_args: dict):
         raise SnowflakeImportError(connection_error_message(exc))
 
 
-def _table_name_filter(table_names: Optional[list[str]]) -> tuple[str, tuple[str, ...]]:
+def _user_requested_table_filter(
+    table_names: Optional[list[str]],
+) -> tuple[str, tuple[str, ...]]:
     if not table_names:
         return "", ()
     placeholders = ", ".join("%s" for _ in table_names)
+    # Preserve legacy Python filtering: raw requested names match metadata names
+    # case-insensitively. Proper quoted-identifier semantics are a separate concern;
+    # in particular, legacy behavior cannot distinguish coexisting ORDERS/orders.
+    return f" AND UPPER(TABLE_NAME) IN ({placeholders})", tuple(table_names)
+
+
+def _resolved_table_filter(
+    table_names: Optional[list[str]],
+) -> tuple[str, tuple[str, ...]]:
+    if not table_names:
+        return "", ()
+    placeholders = ", ".join("%s" for _ in table_names)
+    # These names were already resolved by Snowflake TABLES metadata. Preserve and
+    # use the exact identity for subsequent VIEWS lookup.
     return f" AND TABLE_NAME IN ({placeholders})", tuple(table_names)
 
 
@@ -731,7 +747,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
     db = database.upper()
     sch = schema.upper()
     table_filter = [t.upper() for t in tables] if tables else None
-    table_predicate, table_params = _table_name_filter(table_filter)
+    table_predicate, table_params = _user_requested_table_filter(table_filter)
     metadata_params = (sch, *table_params)
 
     cur = conn.cursor()
@@ -777,7 +793,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             if table_filter else None
         )
         if requested_views is None or requested_views:
-            view_predicate, view_table_params = _table_name_filter(requested_views)
+            view_predicate, view_table_params = _resolved_table_filter(requested_views)
             view_params = (sch, *view_table_params)
             cur.execute(
                 f'SELECT TABLE_NAME, VIEW_DEFINITION FROM "{db}".INFORMATION_SCHEMA.VIEWS '
